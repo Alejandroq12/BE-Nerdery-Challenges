@@ -1,5 +1,12 @@
 Project tshirt_store_api {
   database_type: 'PostgreSQL'
+  Note: '''
+    Defines the database structure and relationships.
+
+    CHECK constraints and PostgreSQL partial indexes are kept in `constraints.sql`.
+    API behavior is defined in `openapi.yaml`.
+    Lifecycle and Stripe decisions are in `docs/data-lifecycle.md`.
+  '''
 }
 
 Enum UserRole {
@@ -17,6 +24,11 @@ Enum OrderStatus {
   CANCELLED
 }
 
+Enum CancellationReason {
+  CUSTOMER_REQUEST
+  SUPERSEDED_BY_NEW_CHECKOUT
+}
+
 Enum PaymentMethod {
   PAYMENT_LINK
   PAYMENT_INTENT
@@ -26,6 +38,8 @@ Enum DiscountType {
   PERCENTAGE
   FIXED_AMOUNT
 }
+
+// ============================================================ Auth
 
 Table users {
   id uuid [pk, default: `gen_random_uuid()`]
@@ -41,20 +55,40 @@ Table users {
   Indexes {
     role [name: 'idx_users_role']
   }
+
+  Note: '''
+    Users are deactivated with `is_active = false`, not hard-deleted.
+    Orders, promo code redemptions, and status history reference users with RESTRICT.
+
+    Future erasure support will anonymize user data.
+
+    CHECK chk_users_email_lower in constraints.sql.
+  '''
 }
 
-Table refresh_tokens {
+Table sessions {
   id uuid [pk, default: `gen_random_uuid()`]
   user_id uuid [not null]
-  token_hash varchar(255) [unique, not null]
+  refresh_token_hash varchar(255) [unique, not null]
   expires_at timestamptz [not null]
   revoked_at timestamptz
   created_at timestamptz [not null, default: `now()`]
 
   Indexes {
-    user_id [name: 'idx_refresh_user']
-    (user_id, revoked_at) [name: 'idx_refresh_active']
+    (user_id, revoked_at) [name: 'idx_sessions_active']
   }
+
+  Note: '''
+    One row represents one authenticated session.
+    A row is created at sign-up or sign-in and revoked at sign-out.
+
+    Refreshing replaces `refresh_token_hash` in the same row, so the old refresh
+    token can no longer be used.
+
+    Revocation sets `revoked_at` instead of deleting the session.
+
+    Partial index idx_sessions_live in constraints.sql.
+  '''
 }
 
 Table password_reset_tokens {
@@ -67,16 +101,22 @@ Table password_reset_tokens {
   created_at timestamptz [not null, default: `now()`]
 
   Indexes {
-    user_id [name: 'idx_reset_user']
     (user_id, created_at) [name: 'idx_reset_ratelimit']
   }
+
+  Note: 'Single use. Using a reset token revokes all sessions for that user.'
 }
+
+
+// ========================================================= Catalogue
 
 Table categories {
   id uuid [pk, default: `gen_random_uuid()`]
   name varchar(100) [unique, not null]
   slug varchar(120) [unique, not null]
   created_at timestamptz [not null, default: `now()`]
+
+  Note: 'Seeded. RESTRICT prevents deleting a category that is used by a product.'
 }
 
 Table products {
@@ -84,49 +124,107 @@ Table products {
   category_id uuid [not null]
   name varchar(200) [not null]
   description text
-  is_disabled boolean [not null, default: false]
+  is_active boolean [not null, default: false]
+  low_stock_cycle int [not null, default: 0]
   created_at timestamptz [not null, default: `now()`]
   updated_at timestamptz [not null, default: `now()`]
+  deleted_at timestamptz
 
   Indexes {
     category_id [name: 'idx_products_category']
-    (is_disabled, created_at) [name: 'idx_products_listing']
+    (deleted_at, is_active, created_at) [name: 'idx_products_manager_listing']
     name [name: 'idx_products_name']
   }
+
+  Note: '''
+    ## Product state
+
+    `is_active = false` is temporary and reversible.
+    `deleted_at` means the product is permanently retired.
+
+    New products start inactive because an active product must have an image.
+    The API exposes ACTIVE, INACTIVE, or RETIRED as one derived state.
+
+    Products are never hard-deleted because order_items references them with RESTRICT.
+
+    ## low_stock_cycle
+
+    Low-stock notifications are product-level because likes are product-level.
+    `low_stock_cycle` increments when total purchasable stock rises above the
+    low-stock threshold. This allows a new notification on the next drop.
+
+    The threshold comes from LOW_STOCK_THRESHOLD.
+
+    idx_products_manager_listing supports manager listings.
+    Partial index idx_products_live in constraints.sql supports the public catalogue.
+  '''
 }
 
 Table product_images {
   id uuid [pk, default: `gen_random_uuid()`]
   product_id uuid [not null]
   url varchar(500) [not null]
+  s3_key varchar(500) [not null]
   is_primary boolean [not null, default: false]
   position int [not null, default: 0]
   created_at timestamptz [not null, default: `now()`]
 
   Indexes {
-    product_id [name: 'idx_images_product']
     (product_id, is_primary) [name: 'idx_images_primary']
+    (product_id, position) [name: 'idx_images_order']
   }
+
+  Note: '''
+    Product images can be hard-deleted because they are not purchase history.
+    Order items do not store image URLs.
+
+    `s3_key` is stored separately so the S3 object can be deleted directly.
+
+    Partial index uq_one_primary_image and CHECK chk_images_position are in
+    constraints.sql.
+  '''
 }
 
 Table product_skus {
   id uuid [pk, default: `gen_random_uuid()`]
   product_id uuid [not null]
-  sku_code varchar(64) [unique, not null]
+  sku_code varchar(64) [not null]
   size varchar(20) [not null]
   color varchar(40) [not null]
   price decimal(10,2) [not null]
   stock_quantity int [not null, default: 0]
-  restock_cycle int [not null, default: 0]
   stripe_price_id varchar(255)
+  is_active boolean [not null, default: true]
+  deleted_at timestamptz
   created_at timestamptz [not null, default: `now()`]
   updated_at timestamptz [not null, default: `now()`]
 
   Indexes {
     product_id [name: 'idx_skus_product']
-    (product_id, size, color) [unique, name: 'uq_sku_variant']
-    stock_quantity [name: 'idx_skus_stock']
+    (product_id, is_active, deleted_at) [name: 'idx_skus_manager_listing']
   }
+
+  Note: '''
+    ## Uniqueness
+
+    uq_sku_variant and uq_sku_code apply only where `deleted_at IS NULL`.
+
+    `is_active = false` keeps the SKU in those unique indexes.
+    Setting `deleted_at` retires the SKU and frees its variant combination and code.
+
+    This assumes sku_code is generated from product, size, and color.
+    Orders identify variants by sku_id, not sku_code.
+
+    ## Stock
+
+    This version stores the current stock quantity, not stock movement history.
+    CHECK chk_skus_stock prevents stock from becoming negative.
+
+    stripe_price_id is BLUEPRINT pending the Stripe workshop.
+
+    Partial indexes uq_sku_variant, uq_sku_code, idx_skus_purchasable and
+    CHECKs chk_skus_price, chk_skus_stock are in constraints.sql.
+  '''
 }
 
 Table product_likes {
@@ -139,13 +237,25 @@ Table product_likes {
     (client_id, product_id) [unique, name: 'uq_like_once']
     product_id [name: 'idx_likes_product']
   }
+
+  Note: 'Deleting a like is allowed because likes are not history.'
 }
+
+// ========================================================== Shopping
 
 Table carts {
   id uuid [pk, default: `gen_random_uuid()`]
   client_id uuid [unique, not null]
   created_at timestamptz [not null, default: `now()`]
   updated_at timestamptz [not null, default: `now()`]
+
+  Note: '''
+    One cart per client. It is created on first use and never deleted.
+
+    The cart does not reserve stock.
+    The system only reduces cart quantities after confirmed payment.
+    Emptying the cart is an explicit customer action.
+  '''
 }
 
 Table cart_items {
@@ -160,7 +270,36 @@ Table cart_items {
     (cart_id, sku_id) [unique, name: 'uq_cart_sku']
     sku_id [name: 'idx_cart_items_sku']
   }
+
+  Note: '''
+    ## Availability
+
+    Availability is calculated when the cart is read from the SKU stock and the
+    product and SKU states. It is not stored on cart_items.
+
+    Unavailable lines stay in the cart and are shown as unavailable.
+    See `docs/data-lifecycle.md` for the cases.
+
+    ## sku_id
+
+    sku_id uses RESTRICT, so a SKU in a cart cannot be hard-deleted.
+    Retiring the SKU keeps the cart line but makes it unavailable.
+
+    ## After payment
+
+    After confirmed payment, subtract the purchased quantity from the matching
+    cart line. Delete the line only if its quantity reaches zero.
+
+    If the customer added more of the same SKU after checkout, the extra quantity
+    stays in the cart.
+
+    Cart lines are locked in ascending sku_id order, matching stock locking order.
+
+    CHECK chk_cart_quantity in constraints.sql.
+  '''
 }
+
+// ========================================================== Ordering
 
 Table orders {
   id uuid [pk, default: `gen_random_uuid()`]
@@ -172,11 +311,14 @@ Table orders {
   discount_amount decimal(10,2) [not null, default: 0]
   total_amount decimal(10,2) [not null]
   promo_code_id uuid
+  promo_code_snapshot varchar(50)
   payment_link_id uuid
   stripe_checkout_session_id varchar(255) [unique]
   stripe_payment_intent_id varchar(255) [unique]
   paid_at timestamptz
   cancelled_at timestamptz
+  cancellation_reason CancellationReason
+  cancelled_by uuid
   created_at timestamptz [not null, default: `now()`]
   updated_at timestamptz [not null, default: `now()`]
 
@@ -185,17 +327,55 @@ Table orders {
     (client_id, status) [name: 'idx_orders_client_status']
     (client_id, total_amount) [name: 'idx_orders_client_total']
     status [name: 'idx_orders_status']
+    cancellation_reason [name: 'idx_orders_cancel_reason']
     delivery_person_id [name: 'idx_orders_delivery']
     promo_code_id [name: 'idx_orders_promo']
     payment_link_id [name: 'idx_orders_payment_link']
-  }
+    }
+
+  Note: '''
+    ## History
+
+    Orders are never deleted. Cancellation is a terminal state.
+
+    ## Payment paths
+
+    PAYMENT_INTENT orders are created as PENDING by POST /checkouts and become
+    PAID after the payment webhook.
+
+    PAYMENT_LINK orders are not created when the link is generated. The webhook
+    creates them already PAID. They are never PENDING.
+    chk_orders_link_never_pending enforces this.
+
+    ## Promo code snapshot
+
+    promo_code_snapshot stores the code used for the order.
+    promo_code_id keeps the relation to promo_codes.
+
+    ## Cancellation
+
+    CUSTOMER_REQUEST means the client cancelled the order.
+    SUPERSEDED_BY_NEW_CHECKOUT means a newer checkout replaced an unpaid order.
+    In that case, cancelled_by is NULL and the order is hidden from client history.
+
+    ## Amounts
+
+    Money uses decimal(10,2) in PostgreSQL and strings in the API.
+    The store currency is USD.
+
+    Stripe identifiers are BLUEPRINT pending the Stripe workshop.
+
+    Partial indexes uq_one_pending_order, idx_orders_paid_history,
+    idx_orders_queue and the orders CHECKs are in constraints.sql.
+  '''
 }
+
 
 Table order_items {
   id uuid [pk, default: `gen_random_uuid()`]
   order_id uuid [not null]
-  sku_id uuid
-  product_id uuid
+  sku_id uuid [not null]
+  product_id uuid [not null]
   product_name varchar(200) [not null]
   sku_code varchar(64) [not null]
   size varchar(20) [not null]
@@ -205,11 +385,23 @@ Table order_items {
   line_total decimal(10,2) [not null]
 
   Indexes {
-    order_id [name: 'idx_order_items_order']
+    (order_id, sku_id) [unique, name: 'uq_order_sku']
     sku_id [name: 'idx_order_items_sku']
     product_id [name: 'idx_order_items_product']
-    (order_id, sku_id) [unique, name: 'uq_order_sku']
   }
+
+  Note: '''
+    Order items are frozen snapshots of what was purchased.
+    Product or SKU changes do not change old order lines.
+
+    sku_id and product_id are NOT NULL and use RESTRICT.
+    Orders are not edited after checkout. A changed cart creates a new order.
+
+    uq_order_sku keeps one line per SKU in an order and makes cart subtraction clear.
+
+    CHECKs chk_order_items_line, chk_order_items_quantity,
+    chk_order_items_price are in constraints.sql.
+  '''
 }
 
 Table order_status_history {
@@ -218,6 +410,7 @@ Table order_status_history {
   from_status OrderStatus
   to_status OrderStatus [not null]
   changed_by uuid
+  reason_code CancellationReason
   reason varchar(255)
   created_at timestamptz [not null, default: `now()`]
 
@@ -225,7 +418,21 @@ Table order_status_history {
     (order_id, created_at) [name: 'idx_status_history_order']
     changed_by [name: 'idx_status_history_actor']
   }
+
+  Note: '''
+    Append-only history of order status changes.
+
+    from_status is NULL on the first row.
+    changed_by is NULL when the system made the change.
+
+    reason_code also appears on orders so the order can be filtered by cancellation
+    reason while this table keeps the full timeline.
+
+    CHECKs chk_status_transition and chk_status_reason_code are in constraints.sql.
+  '''
 }
+
+// ========================================================== Payments
 
 Table payment_links {
   id uuid [pk, default: `gen_random_uuid()`]
@@ -237,10 +444,17 @@ Table payment_links {
   created_at timestamptz [not null, default: `now()`]
 
   Indexes {
-    sku_id [name: 'idx_payment_links_sku']
     created_by [name: 'idx_payment_links_creator']
     (sku_id, is_active) [name: 'idx_payment_links_active']
   }
+
+  Note: '''
+    BLUEPRINT pending the Stripe workshop.
+
+    Currently modeled as one reusable link per SKU.
+    sku_id uses RESTRICT, so a linked SKU cannot be hard-deleted.
+    Retiring a SKU should deactivate its link in application logic.
+  '''
 }
 
 Table stripe_webhook_events {
@@ -258,6 +472,15 @@ Table stripe_webhook_events {
     order_id [name: 'idx_webhook_order']
     processed_at [name: 'idx_webhook_pending']
   }
+
+  Note: '''
+    BLUEPRINT pending the Stripe workshop.
+
+    stripe_event_id is unique so the same Stripe event is not processed twice.
+    The raw payload is stored so failed processing can be retried.
+
+    order_id is nullable because a Payment Link event can arrive before its order exists.
+  '''
 }
 
 Table promo_codes {
@@ -277,6 +500,18 @@ Table promo_codes {
     (code, is_active) [name: 'idx_promo_lookup']
     created_by [name: 'idx_promo_creator']
   }
+
+  Note: '''
+    There is no times_used column.
+    Current usage is calculated by counting non-voided promo_code_redemptions.
+
+    code and discount_type do not change after creation because redemptions reference them.
+
+    FIXED_AMOUNT uses the store currency.
+
+    CHECKs chk_promo_pct_max, chk_promo_usage_limit, chk_promo_min_purchase,
+    chk_promo_value are in constraints.sql.
+  '''
 }
 
 Table promo_code_redemptions {
@@ -285,67 +520,120 @@ Table promo_code_redemptions {
   order_id uuid [unique, not null]
   client_id uuid [not null]
   discount_amount decimal(10,2) [not null]
+  voided_at timestamptz
   created_at timestamptz [not null, default: `now()`]
 
   Indexes {
-    promo_code_id [name: 'idx_redemptions_code']
     client_id [name: 'idx_redemptions_client']
     (promo_code_id, client_id) [name: 'idx_redemptions_code_client']
+    (promo_code_id, voided_at) [name: 'idx_redemptions_usage_count']
   }
+
+  Note: '''
+    ## When a redemption is created
+
+    A redemption is created when payment succeeds, not at checkout.
+    Abandoned or replaced pending orders do not consume a promo use.
+
+    ## What counts as a use
+
+      SELECT count(*) WHERE promo_code_id = ? AND voided_at IS NULL
+
+    Cancelling a paid order sets voided_at instead of deleting the redemption.
+    That use no longer counts, but the history remains.
+
+    ## usage_limit
+
+    To safely consume the final use:
+      1. lock the promo_codes row;
+      2. count non-voided redemptions;
+      3. check usage_limit again;
+      4. insert only if a use is still available.
+
+    This prevents two concurrent payments from using the same final promo use.
+
+    If payment already succeeded but no promo use remains, the behavior is still
+    BLUEPRINT pending the Stripe workshop.
+
+    Partial index idx_redemptions_live and CHECK chk_redemptions_amount are in
+    constraints.sql.
+  '''
 }
+
+// ===================================================== Notifications
 
 Table stock_notifications {
   id uuid [pk, default: `gen_random_uuid()`]
   client_id uuid [not null]
-  sku_id uuid [not null]
-  restock_cycle int [not null, default: 0]
+  product_id uuid [not null]
+  low_stock_cycle int [not null, default: 0]
   stock_at_send int [not null]
   sent_at timestamptz [not null, default: `now()`]
 
   Indexes {
-    (client_id, sku_id, restock_cycle) [unique, name: 'uq_stock_notice_cycle']
-    sku_id [name: 'idx_stock_notice_sku']
+    (client_id, product_id, low_stock_cycle) [unique, name: 'uq_stock_notice_cycle']
+    product_id [name: 'idx_stock_notice_product']
   }
+
+  Note: '''
+    One notification per client, product, and low-stock cycle.
+
+    The unique index prevents duplicate notification records for the same cycle.
+    Restocking increments products.low_stock_cycle so a future low-stock event can
+    notify the client again.
+
+    Notify clients who liked the product and have no paid, non-cancelled order
+    containing any SKU of that product.
+
+    CHECK chk_stock_notice_amount in constraints.sql.
+  '''
 }
 
-Ref: refresh_tokens.user_id > users.id [delete: cascade]
+// ==================================================== Relationships
+// No foreign key uses SET NULL.
+// CASCADE is used only for dependent rows with no history.
+// RESTRICT protects historical references from hard deletion.
+
+Ref: sessions.user_id > users.id [delete: cascade]
 Ref: password_reset_tokens.user_id > users.id [delete: cascade]
 
 Ref: products.category_id > categories.id [delete: restrict]
 Ref: product_images.product_id > products.id [delete: cascade]
-Ref: product_skus.product_id > products.id [delete: cascade]
+Ref: product_skus.product_id > products.id [delete: restrict]
 Ref: product_likes.client_id > users.id [delete: cascade]
 Ref: product_likes.product_id > products.id [delete: cascade]
 
-Ref: carts.client_id > users.id [delete: cascade]
+Ref: users.id - carts.client_id [delete: cascade]
 Ref: cart_items.cart_id > carts.id [delete: cascade]
-Ref: cart_items.sku_id > product_skus.id [delete: cascade]
+Ref: cart_items.sku_id > product_skus.id [delete: restrict]
 
 Ref: orders.client_id > users.id [delete: restrict]
-Ref: orders.delivery_person_id > users.id [delete: set null]
-Ref: orders.promo_code_id > promo_codes.id [delete: set null]
-Ref: orders.payment_link_id > payment_links.id [delete: set null]
-Ref: order_items.order_id > orders.id [delete: cascade]
-Ref: order_items.sku_id > product_skus.id [delete: set null]
-Ref: order_items.product_id > products.id [delete: set null]
-Ref: order_status_history.order_id > orders.id [delete: cascade]
-Ref: order_status_history.changed_by > users.id [delete: set null]
+Ref: orders.delivery_person_id >? users.id [delete: restrict]
+Ref: orders.cancelled_by >? users.id [delete: restrict]
+Ref: orders.promo_code_id >? promo_codes.id [delete: restrict]
+Ref: orders.payment_link_id >? payment_links.id [delete: restrict]
 
-Ref: payment_links.sku_id > product_skus.id [delete: cascade]
+Ref: order_items.order_id > orders.id [delete: cascade]
+Ref: order_items.sku_id > product_skus.id [delete: restrict]
+Ref: order_items.product_id > products.id [delete: restrict]
+Ref: order_status_history.order_id > orders.id [delete: cascade]
+Ref: order_status_history.changed_by >? users.id [delete: restrict]
+
+Ref: payment_links.sku_id > product_skus.id [delete: restrict]
 Ref: payment_links.created_by > users.id [delete: restrict]
-Ref: stripe_webhook_events.order_id > orders.id [delete: set null]
+Ref: stripe_webhook_events.order_id >? orders.id [delete: restrict]
 
 Ref: promo_codes.created_by > users.id [delete: restrict]
+Ref: orders.id - promo_code_redemptions.order_id [delete: cascade]
 Ref: promo_code_redemptions.promo_code_id > promo_codes.id [delete: restrict]
-Ref: promo_code_redemptions.order_id > orders.id [delete: cascade]
 Ref: promo_code_redemptions.client_id > users.id [delete: restrict]
 
 Ref: stock_notifications.client_id > users.id [delete: cascade]
-Ref: stock_notifications.sku_id > product_skus.id [delete: cascade]
+Ref: stock_notifications.product_id > products.id [delete: cascade]
 
 TableGroup auth {
   users
-  refresh_tokens
+  sessions
   password_reset_tokens
 }
 
