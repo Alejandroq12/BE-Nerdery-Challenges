@@ -10,9 +10,15 @@
 
 
 -- your query here
+SELECT
+    c.name AS category,
+    COUNT(fc.film_id) AS film_count
+FROM category c
+LEFT JOIN film_category fc ON fc.category_id = c.category_id
+GROUP BY c.name;
 
 
- /*
+/*
     Challenge 2.
     Write a SQL query that finds the top 5 customers who have spent the most money in the Pagila database.
     - The query should return three columns: first_name, last_name, and total_spent
@@ -21,9 +27,16 @@
     - The query should limit results to only the top 5 highest-spending customers
  */
 
- -- your query here
-
-
+-- your query here
+SELECT
+    c.first_name,
+    c.last_name,
+    SUM(p.amount) AS total_spent
+FROM payment p
+INNER JOIN customer c ON p.customer_id = c.customer_id
+GROUP BY c.customer_id
+ORDER BY total_spent DESC
+LIMIT 5;
 
 
 /*
@@ -34,9 +47,12 @@
     - The time period for "recent" should be within the last 10 years from the current date
     - Results should only include films that have rental records in this time period
 */
-
-
 -- your query here
+SELECT DISTINCT f.title
+FROM film f
+INNER JOIN inventory i ON f.film_id = i.film_id
+INNER JOIN rental r ON r.inventory_id = i.inventory_id
+WHERE r.rental_date >= CURRENT_TIMESTAMP - INTERVAL '10 years';
 
 
 /*
@@ -49,8 +65,13 @@
 
 
 -- your query here
-
-
+SELECT
+    f.title,
+    i.inventory_id
+FROM inventory i
+LEFT JOIN rental r ON r.inventory_id = i.inventory_id
+INNER JOIN film f ON f.film_id = i.film_id
+WHERE r.rental_id IS NULL;
 
 
 /*
@@ -60,10 +81,30 @@
     - title should display the name of each film
     - rental_count should show the total number of times the film was rented
 */
-
-
-
 -- your query here
+-- Step 1: how many times each film was rented (computed once, reused below).
+WITH rentals_per_film AS (
+    SELECT
+        i.film_id,
+        COUNT(r.rental_id) AS times_rented
+    FROM inventory i
+    INNER JOIN rental r ON r.inventory_id = i.inventory_id
+    GROUP BY i.film_id
+),
+-- Step 2: the average of those per-film counts.
+average_rentals AS (
+    SELECT AVG(times_rented) AS avg_times_rented_per_film
+    FROM rentals_per_film
+)
+-- Step 3: keep only the films above the average.
+SELECT
+    f.title,
+    rpf.times_rented AS rental_count
+FROM rentals_per_film rpf
+INNER JOIN film f ON f.film_id = rpf.film_id
+CROSS JOIN average_rentals ar
+WHERE rpf.times_rented > ar.avg_times_rented_per_film
+ORDER BY rental_count DESC;
 
 /*
     Challenge 6.
@@ -76,7 +117,22 @@
 */
 
 -- your query here
-
+SELECT 
+    c.first_name, 
+    c.last_name, 
+    MIN(r.rental_date) AS first_rental, 
+    MAX(r.rental_date) AS last_rental,
+    (DATE(MAX(r.rental_date)) - DATE(MIN(r.rental_date))) AS rental_span_days
+FROM 
+    customer c
+JOIN 
+    rental r ON c.customer_id = r.customer_id
+GROUP BY 
+    c.customer_id, 
+    c.first_name, 
+    c.last_name
+ORDER BY 
+    rental_span_days DESC;
 /*
     Challenge 7.
     Find all customers who have not rented movies from every available genre.
@@ -86,7 +142,30 @@
 
 
 -- your query here
-
+-- Step 1: total number of genres available (computed once).
+WITH total_categories AS (
+    SELECT COUNT(*) AS category_total
+    FROM category
+),
+-- Step 2: how many distinct genres each customer has rented.
+categories_rented_per_customer AS (
+    SELECT
+        r.customer_id,
+        COUNT(DISTINCT fc.category_id) AS categories_rented
+    FROM rental r
+    JOIN inventory i ON r.inventory_id = i.inventory_id
+    JOIN film_category fc ON i.film_id = fc.film_id
+    GROUP BY r.customer_id
+)
+-- Step 3: customers missing at least one genre.
+-- LEFT JOIN + COALESCE also includes customers with no rentals at all.
+SELECT
+    c.first_name,
+    c.last_name
+FROM customer c
+LEFT JOIN categories_rented_per_customer crpc ON crpc.customer_id = c.customer_id
+CROSS JOIN total_categories tc
+WHERE COALESCE(crpc.categories_rented, 0) < tc.category_total;
 
 /*
     Challenge 8.
@@ -110,7 +189,54 @@
 */
 
 -- your work here
+DROP MATERIALIZED VIEW IF EXISTS revenue_by_category;
+CREATE MATERIALIZED VIEW revenue_by_category AS
+SELECT 
+    c.name AS category_name, 
+    SUM(p.amount) AS total_revenue
+FROM 
+    category c
+JOIN 
+    film_category fc ON c.category_id = fc.category_id
+JOIN 
+    inventory i ON fc.film_id = i.film_id
+JOIN 
+    rental r ON i.inventory_id = r.inventory_id
+JOIN 
+    payment p ON r.rental_id = p.rental_id
+GROUP BY 
+    c.name
+ORDER BY 
+    total_revenue DESC;
+
+SELECT * FROM revenue_by_category;
+
+SELECT * FROM revenue_by_category ORDER BY total_revenue DESC LIMIT 3;
+
+REFRESH MATERIALIZED VIEW revenue_by_category;
 
 
+/*
+When to use a materialized view instead of a regular view?
+Use a materialized view when the query is expensive (many joins/aggregations) AND it is run frequently.
+Regular views run their query every time they are called, but materialized views physically save the results to the disk.
+This drastically boosts read performance and prevents the database from repeating heavy calculations on every request.
+It fits reports and dashboards (like revenue per category) where the data doesn't need to be real-time.
 
+Do NOT use it when the consumer needs fully up-to-date data: between refreshes the view returns stale results.
+In that case a regular view (or the query itself, with proper indexes) is the right choice.
 
+How often should it be refreshed?
+It must be refreshed periodically with REFRESH MATERIALIZED VIEW, because it does not update on its own.
+Every refresh re-runs the whole query, so it has a cost: on tables with many transactions (payment, rental)
+refreshing too often can be as expensive as not having the view at all.
+The refresh schedule depends on your need for fresh data versus your database's performance limits.
+
+Nightly or Off-peak: Best for daily reports. The refresh runs once during a low traffic window.
+
+Scheduled Intervals: Ideal for hourly or intra-day updates where slightly stale data is acceptable.
+
+Trigger-based: Updates the view automatically when the underlying tables change. 
+You should generally avoid this for highly active tables because it can 
+ruin the performance benefits of using a materialized view.
+*/
